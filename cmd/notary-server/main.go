@@ -1,22 +1,26 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	_ "expvar"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
 	"github.com/Sirupsen/logrus"
 	_ "github.com/docker/distribution/registry/auth/token"
 	"github.com/endophage/gotuf/signed"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"golang.org/x/net/context"
 
 	"github.com/docker/notary/server"
@@ -85,13 +89,7 @@ func main() {
 	}
 
 	if viper.GetString("store.backend") == "mysql" {
-		dbURL := viper.GetString("storage.db_url")
-		db, err := sql.Open("mysql", dbURL)
-		if err != nil {
-			logrus.Fatal("[Notary Server] Error starting DB driver: ", err.Error())
-			return // not strictly needed but let's be explicit
-		}
-		ctx = context.WithValue(ctx, "metaStore", storage.NewMySQLStorage(db))
+		ctx = context.WithValue(ctx, "metaStore", storage.NewMySQLStorage(getMysqlDB()))
 	} else {
 		ctx = context.WithValue(ctx, "metaStore", storage.NewMemStorage())
 	}
@@ -121,4 +119,40 @@ func debugServer(addr string) {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		logrus.Fatal("[Notary Debug Server] error listening on debug interface: ", err)
 	}
+}
+
+func getMysqlDB() *sql.DB {
+	dbURL := viper.GetString("storage.db_url")
+	useSSL := viper.GetBool("storage.db_use_ssl")
+	if useSSL {
+		tlsConfig := &tls.Config{}
+		caCert := viper.GetString("storage.db_ssl_ca_cert")
+		if caCert != "" {
+			rootCertPool := x509.NewCertPool()
+			pem, err := ioutil.ReadFile(caCert)
+			if err != nil {
+				logrus.Fatal("[Notary Server] Error loading DB CA certificate:", err)
+			}
+			if ok := rootCertPool.AppendCertsFromPEM(pem); !ok {
+				logrus.Fatal("[Notary Server] Error appending DB CA certificates from PEM file:", err)
+			}
+			tlsConfig.RootCAs = rootCertPool
+		}
+		mysql.RegisterTLSConfig("notary", tlsConfig)
+
+		// Append a "tls=notary" parameter to the DSN. Unfortunately,
+		// this takes some care to handle existing DSNs with and without
+		// parameters.
+		if regexp.MustCompile("/.*\\?").MatchString(dbURL) {
+			dbURL += "&tls=notary"
+		} else {
+			dbURL += "?tls=notary"
+		}
+	}
+	db, err := sql.Open("mysql", dbURL)
+	if err != nil {
+		logrus.Fatal("[Notary Server] Error starting DB driver: ", err.Error())
+	}
+
+	return db
 }
